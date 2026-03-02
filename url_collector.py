@@ -10,6 +10,7 @@ from typing import List, Set
 from playwright.async_api import async_playwright, Browser, Page
 
 from logger import bot_logger
+from browserless_connection import connect_browser, USER_AGENT
 
 BASE_URL = "https://mediabiasfactcheck.com"
 
@@ -133,15 +134,8 @@ async def collect_all_urls(progress_callback=None) -> List[str]:
     all_urls: Set[str] = set()
 
     async with async_playwright() as pw:
-        browser: Browser = await pw.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
-        )
-
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
+        browser: Browser = await connect_browser(pw)
+        context = await browser.new_context(user_agent=USER_AGENT)
 
         page = await context.new_page()
 

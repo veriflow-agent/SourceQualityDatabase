@@ -11,6 +11,7 @@ from typing import List, Tuple, Optional
 from playwright.async_api import async_playwright, Browser, BrowserContext
 
 from mbfc_scraper import MBFCScraper
+from browserless_connection import connect_browser
 from supabase_writer import SupabaseWriter
 from logger import bot_logger
 
@@ -129,16 +130,7 @@ async def run_batch(
         raise RuntimeError("Supabase is not configured. Cannot run batch.")
 
     async with async_playwright() as pw:
-        browser: Browser = await pw.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--no-first-run",
-            ]
-        )
+        browser: Browser = await connect_browser(pw)
 
         # Process URLs in chunks of CONCURRENT_PAGES
         total = len(urls)
