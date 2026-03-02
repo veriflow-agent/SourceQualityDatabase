@@ -53,17 +53,18 @@ class SupabaseWriter:
                 bot_logger.logger.warning(f"Could not init LLM: {e}")
 
     # -------------------------------------------------------
-    # DOMAIN DETECTION
+    # DOMAIN DETECTION (fallbacks only - source_domain from
+    # MBFCExtractedData is now the primary source)
     # -------------------------------------------------------
 
     def _extract_domain_from_url(self, mbfc_url: str) -> Optional[str]:
         """
         Try to guess the publication domain from the MBFC page URL slug.
         e.g. mediabiasfactcheck.com/bbc -> bbc.com
-        This is a heuristic — the batch scraper also tries to find it in page text.
+        This is a last-resort heuristic — only used when AI extraction fails.
         """
         slug = mbfc_url.rstrip("/").split("/")[-1]
-        # Simple heuristic: if slug looks like a domain, use it
+        # Only return slug as domain if it already looks like one (has a dot)
         if "." in slug:
             return slug.lower()
         return None
@@ -73,6 +74,7 @@ class SupabaseWriter:
         Find a domain mentioned in the page text.
         Looks for patterns like 'Source: example.com' or bare URLs.
         """
+        skip = {"mediabiasfactcheck", "twitter", "facebook", "instagram", "youtube", "wikipedia"}
         patterns = [
             r'(?:Source|Website|URL|Homepage):\s*(https?://)?([a-zA-Z0-9\-]+\.[a-zA-Z]{2,})',
             r'(?:^|\s)(www\.[a-zA-Z0-9\-]+\.[a-zA-Z]{2,})',
@@ -82,8 +84,6 @@ class SupabaseWriter:
             match = re.search(pattern, text[:3000], re.IGNORECASE | re.MULTILINE)
             if match:
                 domain = match.group(match.lastindex).lower().strip()
-                # Filter out mediabiasfactcheck itself and social media
-                skip = ["mediabiasfactcheck", "twitter", "facebook", "instagram", "youtube"]
                 if not any(s in domain for s in skip):
                     return domain
         return None
@@ -202,21 +202,37 @@ Return ONLY: {{"names": ["name1", "name2", ...]}}"""
         """
         Write a scraped MBFC record to Supabase.
         Returns True on success, False on failure.
+
+        Domain resolution priority:
+        1. source_domain from MBFCExtractedData (extracted by AI from page content)
+        2. domain argument passed in explicitly
+        3. Heuristic from MBFC URL slug (only if it contains a dot)
+        4. Regex search in raw_page_text
+        5. Last resort: MBFC slug + ".unknown"
         """
         if not self.enabled:
             bot_logger.logger.error("Supabase not enabled — cannot write.")
             return False
 
-        # Determine domain
+        # Priority 1: source_domain extracted from page content by the scraper
+        if not domain and hasattr(extracted_data, 'source_domain') and extracted_data.source_domain:
+            domain = extracted_data.source_domain
+
+        # Priority 2: heuristic from MBFC URL slug (only when slug has a dot)
         if not domain:
             domain = self._extract_domain_from_url(mbfc_url)
+
+        # Priority 3: regex scan of raw page text
         if not domain and raw_page_text:
             domain = self._extract_domain_from_text(raw_page_text)
+
+        # Priority 4: last resort - use the MBFC slug so the record isn't lost
         if not domain:
-            # Fall back to using the MBFC slug as a pseudo-domain identifier
             slug = mbfc_url.rstrip("/").split("/")[-1]
             domain = f"{slug}.unknown"
-            bot_logger.logger.warning(f"Could not determine domain for {mbfc_url}, using: {domain}")
+            bot_logger.logger.warning(
+                f"Could not determine domain for {mbfc_url}, using: {domain}"
+            )
 
         domain = domain.lower().strip()
 

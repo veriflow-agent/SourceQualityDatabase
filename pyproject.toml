@@ -1,9 +1,5 @@
-# for MBFC scraping service
-
+# pyproject.toml for MBFC scraping service
 [project]
 name = "mbfc-scraper"
 version = "0.1.0"
-description = "MBFC bulk scraper bot"
-authors = ["Your Name <you@example.com>"]
 requires-python = ">=3.11"
-dependencies = []

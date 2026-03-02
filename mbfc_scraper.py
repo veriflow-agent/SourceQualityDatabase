@@ -18,6 +18,7 @@ try:
     from langchain_openai import ChatOpenAI
     from langchain.prompts import ChatPromptTemplate
     LLM_AVAILABLE = True
+    bot_logger.logger.info("LangChain available - using AI extraction")
 except ImportError:
     LLM_AVAILABLE = False
     bot_logger.logger.warning("LangChain not available - falling back to regex extraction")
@@ -26,6 +27,10 @@ except ImportError:
 class MBFCExtractedData(BaseModel):
     """Structured data extracted from an MBFC page."""
     publication_name: str = Field(description="Name of the publication")
+    source_domain: Optional[str] = Field(
+        default=None,
+        description="The publication's actual website domain, e.g. cnn.com or bbc.co.uk"
+    )
     bias_rating: Optional[str] = Field(default=None)
     bias_score: Optional[float] = Field(default=None)
     factual_reporting: Optional[str] = Field(default=None)
@@ -68,6 +73,12 @@ IMPORTANT GUIDELINES:
 4. failed_fact_checks should be a list - if "None in the Last 5 years", return empty list []
 5. special_tags: include labels like "Questionable Source", "Conspiracy-Pseudoscience", "Satire", etc.
 6. If a field is not found, use null
+7. For source_domain: Look for the publication's ACTUAL website URL anywhere in the text.
+   MBFC pages contain a clickable link to the publication's own website - it often appears as a
+   URL like "https://cnn.com", "https://www.theguardian.com", etc., or labeled "Source:", "Website:".
+   Extract ONLY the bare domain (e.g. "cnn.com", "bbc.co.uk", "theguardian.com").
+   Strip "www.", "https://", "http://". Do NOT return "mediabiasfactcheck.com".
+   If you cannot find a clear publication website URL, return null.
 
 RAW PAGE CONTENT:
 {page_content}
@@ -75,6 +86,7 @@ RAW PAGE CONTENT:
 Respond with ONLY valid JSON matching this structure:
 {{
     "publication_name": "string",
+    "source_domain": "string or null - the publication's own website domain e.g. cnn.com",
     "bias_rating": "string or null",
     "bias_score": "number or null",
     "factual_reporting": "string or null",
@@ -90,6 +102,13 @@ Respond with ONLY valid JSON matching this structure:
     "summary": "string or null",
     "special_tags": ["list of strings"]
 }}"""
+
+# Domains to skip when hunting for source_domain in page text
+_SKIP_DOMAINS = {
+    "mediabiasfactcheck.com", "facebook.com", "twitter.com", "x.com",
+    "instagram.com", "youtube.com", "wikipedia.org", "google.com",
+    "amazon.com", "apple.com", "linkedin.com", "wordpress.com",
+}
 
 
 class MBFCScraper:
@@ -190,23 +209,10 @@ class MBFCScraper:
             }
             setInterval(removeBlockingElements, 1000);
             const observer = new MutationObserver(removeBlockingElements);
-            observer.observe(document.documentElement, { childList: true, subtree: true });
+            observer.observe(document.body, { childList: true, subtree: true });
         """)
 
-        if self.session_cookie and "=" in self.session_cookie:
-            try:
-                parts = self.session_cookie.split("=", 1)
-                await page.context.add_cookies([{
-                    "name": parts[0].strip(),
-                    "value": parts[1].strip(),
-                    "domain": ".mediabiasfactcheck.com",
-                    "path": "/"
-                }])
-            except Exception as e:
-                bot_logger.logger.warning(f"Failed to add session cookie: {e}")
-
     async def _cleanup_page(self, page: Page):
-        """Remove remaining blocking elements after load."""
         try:
             await page.evaluate("""
                 () => {
@@ -286,6 +292,33 @@ class MBFCScraper:
             text = re.sub(pattern, '', text, flags=re.IGNORECASE)
         return text.strip()
 
+    def _extract_source_domain_from_text(self, text: str) -> Optional[str]:
+        """
+        Regex fallback: find the publication's own website domain in page text.
+        Tries labeled patterns first (most reliable), then bare URLs.
+        """
+        # Pattern 1: explicitly labeled - "Source: https://cnn.com", "Website: example.com"
+        labeled = re.search(
+            r'(?:Source|Website|URL|Homepage|Visit):\s*https?://(?:www\.)?'
+            r'([a-zA-Z0-9][a-zA-Z0-9\-]*(?:\.[a-zA-Z0-9][a-zA-Z0-9\-]*)+)',
+            text, re.IGNORECASE
+        )
+        if labeled:
+            candidate = labeled.group(1).lower()
+            if not any(skip in candidate for skip in _SKIP_DOMAINS):
+                return candidate
+
+        # Pattern 2: any https:// URL in the text that isn't a skip domain
+        for match in re.finditer(
+            r'https?://(?:www\.)?([a-zA-Z0-9][a-zA-Z0-9\-]*(?:\.[a-zA-Z]{2,}))(?:/|$|\s)',
+            text
+        ):
+            candidate = match.group(1).lower()
+            if not any(skip in candidate for skip in _SKIP_DOMAINS):
+                return candidate
+
+        return None
+
     async def _extract_with_ai(self, page_content: str) -> Optional[MBFCExtractedData]:
         if not self.llm:
             return self._extract_with_regex(page_content)
@@ -299,6 +332,10 @@ class MBFCScraper:
             data = json.loads(raw if isinstance(raw, str) else str(raw))
             data.setdefault("failed_fact_checks", [])
             data.setdefault("special_tags", [])
+
+            # If AI didn't find source_domain, try regex as backup
+            if not data.get("source_domain"):
+                data["source_domain"] = self._extract_source_domain_from_text(page_content)
 
             return MBFCExtractedData(**data)
         except Exception as e:
@@ -315,6 +352,9 @@ class MBFCScraper:
             else:
                 name_match = re.search(r'Overall,?\s+we\s+rate\s+([^,]+)', page_content, re.IGNORECASE)
                 data["publication_name"] = name_match.group(1).strip() if name_match else "Unknown"
+
+            # Source domain - the publication's real website
+            data["source_domain"] = self._extract_source_domain_from_text(page_content)
 
             bias_match = re.search(r'Bias Rating:\s*([A-Z\-]+(?:\s+[A-Z\-]+)?)\s*\(?([\-\d.]+)?\)?', page_content, re.IGNORECASE)
             if bias_match:
@@ -389,10 +429,10 @@ class MBFCScraper:
 
             extracted = await self._extract_with_ai(text)
             if extracted:
+                domain_info = f" ({extracted.source_domain})" if extracted.source_domain else " (domain not found in page)"
                 bot_logger.logger.info(
-                    f"Scraped: {extracted.publication_name} | "
-                    f"Bias: {extracted.bias_rating} | "
-                    f"Factual: {extracted.factual_reporting}"
+                    f"Scraped: {extracted.publication_name}{domain_info} "
+                    f"| Bias: {extracted.bias_rating} | Factual: {extracted.factual_reporting}"
                 )
             return extracted
 
